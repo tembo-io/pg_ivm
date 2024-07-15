@@ -21,6 +21,7 @@
 #include "catalog/pg_trigger.h"
 #include "commands/cluster.h"
 #include "commands/defrem.h"
+#include "commands/event_trigger.h"
 #include "commands/matview.h"
 #include "commands/tablecmds.h"
 #include "executor/execdesc.h"
@@ -30,6 +31,7 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/print.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "parser/parse_clause.h"
@@ -41,6 +43,7 @@
 #include "rewrite/rewriteManip.h"
 #include "rewrite/rowsecurity.h"
 #include "storage/lmgr.h"
+#include "tcop/deparse_utility.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -220,6 +223,7 @@ static void mv_BuildQueryKey(MV_QueryKey *key, Oid matview_id, int32 query_type)
 static void clean_up_IVM_hash_entry(MV_TriggerHashEntry *entry, bool is_abort);
 
 /* SQL callable functions */
+PG_FUNCTION_INFO_V1(get_command_type);
 PG_FUNCTION_INFO_V1(IVM_immediate_before);
 PG_FUNCTION_INFO_V1(IVM_immediate_maintenance);
 PG_FUNCTION_INFO_V1(ivm_visible_in_prestate);
@@ -651,6 +655,52 @@ tuplestore_copy(Tuplestorestate *tuplestore, Relation rel)
  *		Incremental View Maintenance routines
  * ---------------------------------------------------
  */
+
+Datum
+get_command_type(PG_FUNCTION_ARGS)
+{
+	CollectedCommand *cmd = (CollectedCommand *) PG_GETARG_POINTER(0);
+	ListCell *subcmdCell = NULL;
+
+  CollectedATSubcmd *collAlterSubcmd = NULL;
+  AlterTableCmd *alterCmd = NULL;
+
+  Oid newPartRelid = InvalidOid;
+  Oid oldPartRelid = InvalidOid;
+
+  /* this function is intended for ALTER TABLE only */
+	if (cmd->type != SCT_AlterTable)
+  {
+		elog(ERROR, "command is not ALTER TABLE");
+  }
+
+  /* expect at least one sub-command */
+  subcmdCell = list_head(cmd->d.alterTable.subcmds);
+	if (subcmdCell == NULL)
+  {
+		elog(ERROR, "empty alter table subcommand list");
+  }
+
+  collAlterSubcmd = lfirst(subcmdCell);
+  alterCmd = castNode(AlterTableCmd, collAlterSubcmd->parsetree);
+  if (alterCmd->subtype == AT_AttachPartition)
+  {
+    newPartRelid = collAlterSubcmd->address.objectId;
+  }
+  else if (alterCmd->subtype == AT_DetachPartition)
+  {
+    oldPartRelid = collAlterSubcmd->address.objectId;
+  }
+  else
+  {
+    return PointerGetDatum(NULL);
+  }
+
+  elog(INFO, "new: %u, old: %u", newPartRelid, oldPartRelid);
+  elog_node_display(INFO, "cmd->parsetree", cmd->parsetree, true);
+
+	return PointerGetDatum(NULL);
+}
 
 /*
  * IVM_immediate_before
