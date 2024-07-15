@@ -17,6 +17,13 @@ SELECT pg_catalog.pg_extension_config_dump('pg_catalog.pg_ivm_immv', '');
 
 -- functions
 
+CREATE FUNCTION get_command_type(pg_ddl_command)
+RETURNS void
+IMMUTABLE
+STRICT
+AS 'MODULE_PATHNAME', 'get_command_type'
+LANGUAGE C;
+
 CREATE FUNCTION create_immv(text, text)
 RETURNS bigint 
 STRICT
