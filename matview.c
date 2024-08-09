@@ -158,6 +158,11 @@ static uint64 refresh_immv_datafill(DestReceiver *dest, Query *query,
 static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
 static void OpenImmvIncrementalMaintenance(void);
 static void CloseImmvIncrementalMaintenance(void);
+static void IVM_perform_before(char *matviewOid_text, char *ex_lock_text);
+static void IVM_perform_maintenance(char *matviewOid_text, Relation rel,
+                                    Tuplestorestate *tg_oldtable,
+                                    Tuplestorestate *tg_newtable,
+                                    TriggerEvent tg_event);
 
 static Query *rewrite_query_for_preupdate_state(Query *query, List *tables,
 								  ParseState *pstate, List *rte_path, Oid matviewid);
@@ -223,7 +228,7 @@ static void mv_BuildQueryKey(MV_QueryKey *key, Oid matview_id, int32 query_type)
 static void clean_up_IVM_hash_entry(MV_TriggerHashEntry *entry, bool is_abort);
 
 /* SQL callable functions */
-PG_FUNCTION_INFO_V1(get_command_type);
+PG_FUNCTION_INFO_V1(changes_partitions);
 PG_FUNCTION_INFO_V1(IVM_immediate_before);
 PG_FUNCTION_INFO_V1(IVM_immediate_maintenance);
 PG_FUNCTION_INFO_V1(ivm_visible_in_prestate);
@@ -656,8 +661,15 @@ tuplestore_copy(Tuplestorestate *tuplestore, Relation rel)
  * ---------------------------------------------------
  */
 
+/*
+ * changes_partitions
+ *
+ * Accepts a parsed ALTER TABLE command (from pg_event_trigger_ddl_commands),
+ * returning whether that ALTER TABLE command contains subcommands related to
+ * changing partitions (i.e. ATTACH or DETACH PARTITION).
+ */
 Datum
-get_command_type(PG_FUNCTION_ARGS)
+changes_partitions(PG_FUNCTION_ARGS)
 {
 	CollectedCommand *cmd = (CollectedCommand *) PG_GETARG_POINTER(0);
 	ListCell *subcmdCell = NULL;
@@ -681,6 +693,10 @@ get_command_type(PG_FUNCTION_ARGS)
 		elog(ERROR, "empty alter table subcommand list");
   }
 
+  /*
+   * This saves the OIDs of the affected partitions, for later use
+   * in an incremental approach.
+   */
   collAlterSubcmd = lfirst(subcmdCell);
   alterCmd = castNode(AlterTableCmd, collAlterSubcmd->parsetree);
   if (alterCmd->subtype == AT_AttachPartition)
@@ -693,11 +709,20 @@ get_command_type(PG_FUNCTION_ARGS)
   }
   else
   {
-    return PointerGetDatum(NULL);
+    return BoolGetDatum(false);
   }
 
-  elog(INFO, "new: %u, old: %u", newPartRelid, oldPartRelid);
-  elog_node_display(INFO, "cmd->parsetree", cmd->parsetree, true);
+	return BoolGetDatum(true);
+}
+
+Datum
+IVM_immediate_before(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	char	   *matviewOid_text = trigdata->tg_trigger->tgargs[0];
+	char	   *ex_lock_text = trigdata->tg_trigger->tgargs[1];
+
+  IVM_perform_before(matviewOid_text, ex_lock_text);
 
 	return PointerGetDatum(NULL);
 }
@@ -709,12 +734,9 @@ get_command_type(PG_FUNCTION_ARGS)
  * invoked firstly in the same statement, we save the transaction id and the
  * command id at that time.
  */
-Datum
-IVM_immediate_before(PG_FUNCTION_ARGS)
+static void
+IVM_perform_before(char *matviewOid_text, char *ex_lock_text)
 {
-	TriggerData *trigdata = (TriggerData *) fcinfo->context;
-	char	   *matviewOid_text = trigdata->tg_trigger->tgargs[0];
-	char	   *ex_lock_text = trigdata->tg_trigger->tgargs[1];
 	Oid			matviewOid;
 	MV_TriggerHashEntry *entry;
 	bool	found;
@@ -784,8 +806,19 @@ IVM_immediate_before(PG_FUNCTION_ARGS)
 
 	entry->before_trig_count++;
 
+  return;
+}
 
-	return PointerGetDatum(NULL);
+Datum
+IVM_immediate_maintenance(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	char	   *matviewOid_text = trigdata->tg_trigger->tgargs[0];
+  IVM_perform_maintenance(matviewOid_text, trigdata->tg_relation,
+                          trigdata->tg_oldtable, trigdata->tg_newtable,
+                          trigdata->tg_event);
+
+  return PointerGetDatum(NULL);
 }
 
 /*
@@ -795,16 +828,15 @@ IVM_immediate_before(PG_FUNCTION_ARGS)
  * For each table, tuplestores of transition tables are collected.
  * and after the last modification
  */
-Datum
-IVM_immediate_maintenance(PG_FUNCTION_ARGS)
+static void
+IVM_perform_maintenance(char *matviewOid_text, Relation rel,
+                        Tuplestorestate *tg_oldtable,
+                        Tuplestorestate *tg_newtable, TriggerEvent tg_event)
 {
-	TriggerData *trigdata = (TriggerData *) fcinfo->context;
-	Relation	rel;
 	Oid			relid;
 	Oid			matviewOid;
 	Query	   *query;
 	Query	   *rewritten = NULL;
-	char	   *matviewOid_text = trigdata->tg_trigger->tgargs[0];
 	Relation	matviewRel;
 	int old_depth = immv_maintenance_depth;
 
@@ -831,7 +863,6 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	pstate->p_queryEnv = queryEnv;
 	pstate->p_expr_kind = EXPR_KIND_SELECT_TARGET;
 
-	rel = trigdata->tg_relation;
 	relid = rel->rd_id;
 
 	matviewOid = DatumGetObjectId(DirectFunctionCall1(oidin, CStringGetDatum(matviewOid_text)));
@@ -879,17 +910,17 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	}
 
 	/* Save the transition tables and make a request to not free immediately */
-	if (trigdata->tg_oldtable)
+	if (tg_oldtable)
 	{
 		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-		table->old_tuplestores = lappend(table->old_tuplestores, tuplestore_copy(trigdata->tg_oldtable, rel));
+		table->old_tuplestores = lappend(table->old_tuplestores, tuplestore_copy(tg_oldtable, rel));
 		entry->has_old = true;
 		MemoryContextSwitchTo(oldcxt);
 	}
-	if (trigdata->tg_newtable)
+	if (tg_newtable)
 	{
 		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-		table->new_tuplestores = lappend(table->new_tuplestores, tuplestore_copy(trigdata->tg_newtable, rel));
+		table->new_tuplestores = lappend(table->new_tuplestores, tuplestore_copy(tg_newtable, rel));
 		entry->has_new = true;
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -897,7 +928,7 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	/* If this is not the last AFTER trigger call, immediately exit. */
 	Assert (entry->before_trig_count >= entry->after_trig_count);
 	if (entry->before_trig_count != entry->after_trig_count)
-		return PointerGetDatum(NULL);
+		return;
 
 	/*
 	 * If this is the last AFTER trigger call, continue and update the view.
@@ -953,7 +984,7 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	 * a row with NULL value (or 0 for count()). So, in this case, we refresh the
 	 * view instead of truncating it.
 	 */
-	if (TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event))
+	if (TRIGGER_FIRED_BY_TRUNCATE(tg_event))
 	{
 		if (!(query->hasAggs && query->groupClause == NIL))
 		{
@@ -1013,7 +1044,7 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 		/* Restore userid and security context */
 		SetUserIdAndSecContext(save_userid, save_sec_context);
 
-		return PointerGetDatum(NULL);
+		return;
 	}
 
 	/*
@@ -1186,7 +1217,7 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	/* Restore userid and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);
 
-	return PointerGetDatum(NULL);
+	return;
 }
 
 /*
