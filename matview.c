@@ -713,7 +713,7 @@ changes_partitions(PG_FUNCTION_ARGS)
   /* this function is intended for ALTER TABLE only */
 	if (cmd->type != SCT_AlterTable)
   {
-		elog(ERROR, "command is not ALTER TABLE");
+		return BoolGetDatum(false);
   }
 
   /* expect at least one sub-command */
